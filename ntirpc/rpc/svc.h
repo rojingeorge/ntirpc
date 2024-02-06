@@ -54,6 +54,7 @@
 #ifdef USE_LTTNG_NTIRPC
 #include "lttng/xprt.h"
 #endif
+#include <unistd.h>
 
 typedef struct svc_xprt SVCXPRT;
 
@@ -107,8 +108,6 @@ enum xprt_stat {
 #define SVCSET_XP_FLAGS         8
 #define SVCGET_XP_FREE_USER_DATA        15
 #define SVCSET_XP_FREE_USER_DATA        16
-#define SVCGET_XP_UNREF_USER_DATA        17
-#define SVCSET_XP_UNREF_USER_DATA        18
 
 /*
  * Operations for rpc_control().
@@ -121,7 +120,6 @@ enum xprt_stat {
 #define RPC_SVC_FDSET_SET       5
 
 typedef enum xprt_stat (*svc_xprt_fun_t) (SVCXPRT *);
-typedef void (*svc_xprt_void_fun_t) (SVCXPRT *);
 typedef struct svc_req *(*svc_xprt_alloc_fun_t) (SVCXPRT *, XDR *);
 typedef void (*svc_xprt_free_fun_t) (struct svc_req *, enum xprt_stat);
 
@@ -142,14 +140,11 @@ typedef struct svc_init_params {
 	u_int gss_max_gc;
 	uint32_t channels;
 	int32_t idle_timeout;
-	uint32_t thr_stack_size;
 } svc_init_params;
 
 /* Svc param flags */
 #define SVC_FLAG_NONE             0x0000
 #define SVC_FLAG_NOREG_XPRTS      0x0001
-
-#define SVC_PARAM_HAS_THR_STACK_SIZE 1
 
 /*
  * SVCXPRT xp_flags
@@ -166,7 +161,6 @@ typedef struct svc_init_params {
 #define SVC_XPRT_FLAG_DESTROYING	0x0020	/* SVC_DESTROY() was called */
 #define SVC_XPRT_FLAG_RELEASING		0x0040	/* (*xp_destroy) was called */
 #define SVC_XPRT_FLAG_UREG		0x0080
-#define SVC_XPRT_TREE_LOCKED		0x0100
 
 #define SVC_XPRT_FLAG_DESTROYED (SVC_XPRT_FLAG_DESTROYING \
 				| SVC_XPRT_FLAG_RELEASING)
@@ -174,11 +168,6 @@ typedef struct svc_init_params {
 /* uint32_t instructions */
 #define SVC_XPRT_FLAG_LOCKED		0x00010000
 #define SVC_XPRT_FLAG_UNLOCK		0x00020000
-
-/* This flag serves as an instruction during svcxprt lookup, to not
- * implicitly create a new svcxprt, if the lookup does not find one.
- */
-#define SVC_XPRT_FLAG_LOOKUP_ONLY	0x00040000
 
 /*
  * SVC_REF flags
@@ -211,6 +200,12 @@ typedef enum xprt_type {
 	XPRT_VSOCK_RENDEZVOUS
 } xprt_type_t;
 
+/*
+ * Socket to use on svcxxx_ncreate call to get default socket
+ */
+#define RPC_ANYSOCK -1
+#define RPC_ANYFD RPC_ANYSOCK
+
 struct SVCAUTH;			/* forward decl. */
 struct svc_req;			/* forward decl. */
 
@@ -238,17 +233,11 @@ struct svc_xprt {
 
 		/** Unlink xprt from it's lookup table. */
 		void (*xp_unlink) (SVCXPRT *, u_int, const char *, const int);
-
 		/** actually destroy after xp_destroy_it and xp_release_it */
 		void (*xp_destroy) (SVCXPRT *, u_int, const char *, const int);
 
 		/** catch-all function */
 		bool (*xp_control) (SVCXPRT *, const u_int, void *);
-
-		/** Remove references: of xprt from user-data, and of user-data
-		 * from xprt.
-		 */
-		svc_xprt_void_fun_t xp_unref_user_data;
 
 		/** free client user data */
 		svc_xprt_fun_t xp_free_user_data;
@@ -500,9 +489,23 @@ static inline void svc_destroy_it(SVCXPRT *xprt,
 	/* unlink before dropping last ref */
 	(*(xprt)->xp_ops->xp_unlink)(xprt, flags, tag, line);
 
-	/* Remove references: of xprt from user-data; of user-data from xprt */
-	if ((xprt)->xp_ops->xp_unref_user_data) {
-		(*(xprt)->xp_ops->xp_unref_user_data)(xprt);
+	/* Check if the connection was already set as dead or closed,
+	 * If set, let's cleanup and close the FDs, so that FIN-ACK
+	 * could be sent to the client immediately */
+	flags = atomic_postclear_uint16_t_bits(&xprt->xp_flags,
+					       SVC_XPRT_FLAG_CLOSE);
+
+	if ((flags & SVC_XPRT_FLAG_CLOSE)
+	    && xprt->xp_fd != RPC_ANYFD) {
+		XPRT_TRACE(xprt, "WARNING! Connection already closed!",
+				  tag, line);
+		(void)close(xprt->xp_fd);
+		__warnx(TIRPC_DEBUG_FLAG_WARN,
+			"%s: Connection already closed, hence fd %d closed",
+			 __func__, xprt->xp_fd);
+		xprt->xp_fd = RPC_ANYFD;
+		if (xprt->xp_fd_send != RPC_ANYFD)
+			(void)close(xprt->xp_fd_send);
 	}
 
 	svc_release_it(xprt, SVC_RELEASE_FLAG_NONE, tag, line);
@@ -614,11 +617,7 @@ __END_DECLS
 __BEGIN_DECLS
 extern void rpctest_service(void);
 __END_DECLS
-/*
- * Socket to use on svcxxx_ncreate call to get default socket
- */
-#define RPC_ANYSOCK -1
-#define RPC_ANYFD RPC_ANYSOCK
+
 /*
  * Usual sizes for svcxxx_ncreate
  */
